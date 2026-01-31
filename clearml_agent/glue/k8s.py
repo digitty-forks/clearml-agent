@@ -469,7 +469,7 @@ class K8sIntegration(Worker):
     def run_one_task(self, queue: Text, task_id: Text, worker_args=None, task_session=None, **_):
         print('Pulling task {} launching on kubernetes cluster'.format(task_id))
         session = task_session or self._session
-        task_data = self._session.get(service="tasks", action="get_all", version="2.13", id=[task_id])['tasks'][0]
+        task_data = session.get(service="tasks", action="get_all", version="2.13", id=[task_id])['tasks'][0]
 
         # push task into the k8s queue, so we have visibility on pending tasks in the k8s scheduler
         if self._is_same_tenant(task_session):
