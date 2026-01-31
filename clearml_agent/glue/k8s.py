@@ -22,6 +22,7 @@ from clearml_agent.definitions import (
     ENV_DOCKER_IMAGE,
     ENV_AGENT_GIT_USER,
     ENV_AGENT_GIT_PASS,
+    ENV_AGENT_GIT_HOST,
     ENV_FORCE_SYSTEM_SITE_PACKAGES,
     ENV_AGENT_DEBUG_GET_NEXT_TASK,
 )
@@ -466,6 +467,19 @@ class K8sIntegration(Worker):
     def get_default_docker_image(self, session, queue: str) -> str:
         return str(ENV_DOCKER_IMAGE.get() or session.config.get("agent.default_docker.image", "nvidia/cuda"))
 
+    def _get_extra_task_config(self):
+        git_user = ENV_AGENT_GIT_USER.get() or self._session.config.get("agent.git_user", None)
+        git_pass = ENV_AGENT_GIT_PASS.get() or self._session.config.get("agent.git_pass", None)
+        git_host = ENV_AGENT_GIT_HOST.get() or self._session.config.get("agent.git_host", None)
+        git_section = self._session.config.get("agent.git", None)
+        return [
+            'agent.package_manager.system_site_packages: true' if self._force_system_site_packages else '',
+            'agent.git_user: "{}"'.format(git_user) if git_user else '',
+            'agent.git_pass: "{}"'.format(git_pass) if git_pass else '',
+            'agent.git_host: "{}"'.format(git_host) if git_host else '',
+            'agent.git: {}'.format(json.dumps(git_section)) if git_section else '',
+        ]
+
     def run_one_task(self, queue: Text, task_id: Text, worker_args=None, task_session=None, **_):
         print('Pulling task {} launching on kubernetes cluster'.format(task_id))
         session = task_session or self._session
@@ -531,14 +545,7 @@ class K8sIntegration(Worker):
             )
 
         # get the clearml.conf encoded file, make sure we use system packages!
-
-        git_user = ENV_AGENT_GIT_USER.get() or self._session.config.get("agent.git_user", None)
-        git_pass = ENV_AGENT_GIT_PASS.get() or self._session.config.get("agent.git_pass", None)
-        extra_config_values = [
-            'agent.package_manager.system_site_packages: true' if self._force_system_site_packages else '',
-            'agent.git_user: "{}"'.format(git_user) if git_user else '',
-            'agent.git_pass: "{}"'.format(git_pass) if git_pass else '',
-        ]
+        extra_config_values = self._get_extra_task_config()
 
         # noinspection PyProtectedMember
         config_content = (

@@ -127,14 +127,14 @@ class VCS(object):
         """
         Return URL with configured user/password
         """
-        return self.add_auth(self.session.config, self.url)
+        return self.add_auth(self.session.config, self.url, log=self.log)
 
     @property
     def url_without_auth(self):
         """
         Return URL without configured user/password
         """
-        return self.add_auth(self.session.config, self.url, reset_auth=True)
+        return self.add_auth(self.session.config, self.url, reset_auth=True, log=self.log)
 
     @abc.abstractmethod
     def executable_name(self):
@@ -352,32 +352,57 @@ class VCS(object):
         if not self.session.config.agent.translate_ssh:
             return
 
-        # if we have git_user / git_pass replace ssh credentials with https authentication
-        if (ENV_AGENT_GIT_USER.get() or self.session.config.get('agent.git_user', None)) and \
-                (ENV_AGENT_GIT_PASS.get() or self.session.config.get('agent.git_pass', None)):
+        # Try obtaining git credentials from configuration.
+        # Make sure config matched host if we have a git host configured and it's different than the URL host,
+        # however, we should make sure to pass the correct host if is an ssh@ URL that furl failed to parse
+        ssh_git_url_match = self.SSH_URL_GIT_SYNTAX.match(self.url)
+        config_user, config_pass = self._get_config_creds(
+            config=self.session.config,
+            url_host=(ssh_git_url_match and ssh_git_url_match.groupdict().get("host")) or furl(self.url).host,
+            log=self.log
+        )
+        if not (config_user and config_pass):
+            return
 
-            # only apply to a specific domain (if requested)
-            config_domain = \
-                ENV_AGENT_GIT_HOST.get() or self.session.config.get("agent.git_host", None)
-            if config_domain:
-                if config_domain != furl(self.url).host:
-                    # bail out here if we have a git_host configured and it's different than the URL host
-                    # however, we should make sure this is not an ssh@ URL that furl failed to parse
-                    ssh_git_url_match = self.SSH_URL_GIT_SYNTAX.match(self.url)
-                    if not ssh_git_url_match or config_domain != ssh_git_url_match.groupdict().get("host"):
-                        # do not replace to ssh url
-                        return
+        # If we have git_user / git_pass replace ssh credentials with https authentication
 
-            repl_scheme = (
-                ENV_SSH_URL_REPLACEMENT_SCHEME.get()
-                or self.session.config.get("agent.translate_ssl_replacement_scheme")
-                or "https"
-            )
-            new_url = self.replace_ssh_url(self.url, replacement_scheme=repl_scheme)
-            if new_url != self.url:
-                print("Using user/pass credentials - replacing ssh url '{}' with https url '{}'".format(
-                    self.url, new_url))
-                self.url = new_url
+        repl_scheme = (
+            ENV_SSH_URL_REPLACEMENT_SCHEME.get()
+            or self.session.config.get("agent.translate_ssl_replacement_scheme")
+            or "https"
+        )
+        new_url = self.replace_ssh_url(self.url, replacement_scheme=repl_scheme)
+        if new_url != self.url:
+            print("Using user/pass credentials - replacing ssh url '{}' with https url '{}'".format(
+                self.url, new_url))
+            self.url = new_url
+
+        # # if we have git_user / git_pass replace ssh credentials with https authentication
+        # if (ENV_AGENT_GIT_USER.get() or self.session.config.get('agent.git_user', None)) and \
+        #         (ENV_AGENT_GIT_PASS.get() or self.session.config.get('agent.git_pass', None)):
+        #
+        #     # only apply to a specific domain (if requested)
+        #     config_domain = \
+        #         ENV_AGENT_GIT_HOST.get() or self.session.config.get("agent.git_host", None)
+        #     if config_domain:
+        #         if config_domain != furl(self.url).host:
+        #             # bail out here if we have a git_host configured and it's different than the URL host
+        #             # however, we should make sure this is not an ssh@ URL that furl failed to parse
+        #             ssh_git_url_match = self.SSH_URL_GIT_SYNTAX.match(self.url)
+        #             if not ssh_git_url_match or config_domain != ssh_git_url_match.groupdict().get("host"):
+        #                 # do not replace to ssh url
+        #                 return
+        #
+        #     repl_scheme = (
+        #         ENV_SSH_URL_REPLACEMENT_SCHEME.get()
+        #         or self.session.config.get("agent.translate_ssl_replacement_scheme")
+        #         or "https"
+        #     )
+        #     new_url = self.replace_ssh_url(self.url, replacement_scheme=repl_scheme)
+        #     if new_url != self.url:
+        #         print("Using user/pass credentials - replacing ssh url '{}' with https url '{}'".format(
+        #             self.url, new_url))
+        #         self.url = new_url
 
     def clone(self, branch=None):
         # type: (Text) -> None
@@ -517,7 +542,47 @@ class VCS(object):
         return Argv(self.executable_name, *argv)
 
     @classmethod
-    def add_auth(cls, config, url, reset_auth=False):
+    def _get_config_creds(cls, config, url_host, log=None) -> Tuple[Optional[str], Optional[str]]:
+        config_user = ENV_AGENT_GIT_USER.get() or config.get(f"agent.{cls.executable_name}_user", None)
+        config_pass = ENV_AGENT_GIT_PASS.get() or config.get(f"agent.{cls.executable_name}_pass", None)
+        config_host = ENV_AGENT_GIT_HOST.get() or config.get(f"agent.{cls.executable_name}_host", None)
+
+        url_host = (url_host or "").lower()
+
+        def match_host(h):
+            nonlocal url_host
+            return (
+                url_host.startswith(h.lower())
+                if config.get("agent.git_host_match_prefix", False)
+                else url_host == h.lower()
+            )
+
+        result = (
+            (config_user, config_pass)
+            if not config_host or match_host(config_host)
+            else (None, None)
+        )
+
+        extra_credentials = config.get(f"agent.{cls.executable_name}.extra_credentials", None)
+        if extra_credentials and log:
+            log.info(f"Scanning extra {cls.executable_name} credentials")
+        for i, creds in enumerate(extra_credentials or []):
+            username = creds.get("user", creds.get("username", None))
+            password = creds.get("pass", creds.get("password", None))
+            host = creds.get("host", None)
+            if not (username and password and host):
+                if log:
+                    log.warning("Git extra credentials entry #{i} does not contain user, pass or host, skipping")
+                continue
+            if match_host(host):
+                if log:
+                    log.info(f"Matched extra {cls.executable_name} credentials for host {host} user {username}")
+                return username, password
+
+        return result
+
+    @classmethod
+    def add_auth(cls, config, url, reset_auth=False, log=None):
         """
         Add username and password to URL if missing from URL and present in config.
         Does not modify ssh URLs.
@@ -530,19 +595,17 @@ class VCS(object):
             return url
         if parsed_url.scheme in ["", "ssh"] or (parsed_url.scheme or '').startswith("git"):
             return parsed_url.url
-        config_user = ENV_AGENT_GIT_USER.get() or config.get("agent.{}_user".format(cls.executable_name), None)
-        config_pass = ENV_AGENT_GIT_PASS.get() or config.get("agent.{}_pass".format(cls.executable_name), None)
-        config_domain = ENV_AGENT_GIT_HOST.get() or config.get("agent.{}_host".format(cls.executable_name), None)
+        if reset_auth:
+            parsed_url.set(username=None, password=None)
+            return parsed_url.url
+
+        config_user, config_pass = cls._get_config_creds(config, parsed_url.host, log=log)
         if (
             (not (parsed_url.username and parsed_url.password))
             and config_user
             and config_pass
-            and (not config_domain or config_domain.lower() == parsed_url.host)
         ):
-            if reset_auth:
-                parsed_url.set(username=None, password=None)
-            else:
-                parsed_url.set(username=config_user, password=config_pass)
+            parsed_url.set(username=config_user, password=config_pass)
         return parsed_url.url
 
     @abc.abstractmethod

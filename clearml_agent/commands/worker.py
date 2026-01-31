@@ -56,6 +56,7 @@ from clearml_agent.definitions import (
     ENV_TASK_EXTRA_PYTHON_PATH,
     ENV_AGENT_GIT_USER,
     ENV_AGENT_GIT_PASS,
+    ENV_AGENT_GIT_HOST,
     ENV_WORKER_ID,
     ENV_WORKER_TAGS,
     ENV_DOCKER_SKIP_GPUS_FLAG,
@@ -4501,6 +4502,9 @@ class Worker(ServiceCommandSection):
                                            self._session.config.get("agent.git_user", None)))
         temp_config.put("agent.git_pass", (ENV_AGENT_GIT_PASS.get() or
                                            self._session.config.get("agent.git_pass", None)))
+        temp_config.put("agent.git_host", (ENV_AGENT_GIT_HOST.get() or
+                                           self._session.config.get("agent.git_host", None)))
+        temp_config.put("agent.git", self._session.config.get("agent.git", None))
 
         force_system_site_packages = ENV_FORCE_SYSTEM_SITE_PACKAGES.get()
         force_system_site_packages = force_system_site_packages if force_system_site_packages is not None else True
