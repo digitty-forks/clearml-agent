@@ -8,7 +8,7 @@ from collections import deque
 from itertools import starmap
 from threading import Thread, Event
 from time import time
-from typing import Sequence, List, Union, Dict, Optional
+from typing import Sequence, List, Union, Dict, Optional, Any
 
 from .._vendor import attr
 import psutil
@@ -298,7 +298,50 @@ class ResourceMonitor(object):
             pending=True,
         )
 
+    def _fix_active_gpus(self) -> None:
+        """
+        Fix active gpus when no gpus are being reported because of unexpected NVIDIA_VISIBLE_DEVICES values
+        if no gpus are reported, then report all of them
+        """
+        if not self._gpustat:
+            return
+        active_gpus = os.environ.get("NVIDIA_VISIBLE_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        try:
+            gpu_stat = self._gpustat.new_query(per_process_stats=False)
+            skips_all = True
+            for gpu in gpu_stat:
+                if not self._skip_nonactive_gpu(gpu):
+                    skips_all = False
+                    break
+            if skips_all and active_gpus != "none":
+                self._active_gpus = None
+        except Exception as e:
+            logging.getLogger("clearml.resource_monitor").warning(
+                "Could not fetch GPU stats: {}".format(e)
+            )
+
+    def _skip_nonactive_gpu(self, gpu: Any) -> bool:
+        if self._active_gpus is False:
+            return True
+        if not self._active_gpus:
+            return False
+        # noinspection PyBroadException
+        try:
+            uuid = getattr(gpu, "uuid", None)
+            mig_uuid = getattr(gpu, "mig_uuid", None)
+            return (
+                str(gpu.index) not in self._active_gpus
+                and (not uuid or uuid not in self._active_gpus)
+                and (not mig_uuid or mig_uuid not in self._active_gpus)
+            )
+        except Exception:
+            pass
+        return False
+
+
     def _daemon(self):
+        self._fix_active_gpus()
+
         last_cluster_report = 0
         seconds_since_started = 0
         reported = 0
@@ -450,15 +493,8 @@ class ResourceMonitor(object):
                 report_index = 0
                 for i, g in enumerate(gpu_stat.gpus):
                     # only monitor the active gpu's, if none were selected, monitor everything
-                    if self._active_gpus:
-                        uuid = getattr(g, "uuid", None)
-                        mig_uuid = getattr(g, "mig_uuid", None)
-                        if (
-                            str(g.index) not in self._active_gpus
-                            and (not uuid or uuid not in self._active_gpus)
-                            and (not mig_uuid or mig_uuid not in self._active_gpus)
-                        ):
-                            continue
+                    if self._skip_nonactive_gpu(g):
+                        continue
                     stats["gpu_temperature_{}".format(report_index)] = g["temperature.gpu"]
 
                     if g["utilization.gpu"] is not None:
