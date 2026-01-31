@@ -521,9 +521,13 @@ class K8sIntegration(Worker):
         container = get_task_container(session, task_id)
         if not container.get('image'):
             container['image'] = self.get_default_docker_image(session, queue)
-            container['arguments'] = session.config.get("agent.default_docker.arguments", None)
+            if not container.get('arguments'):
+                container['arguments'] = session.config.get("agent.default_docker.arguments", None)
             set_task_container(
-                session, task_id, docker_image=container['image'], docker_arguments=container['arguments']
+                session, task_id,
+                docker_image=container.get("image"),
+                docker_arguments=container.get("arguments"),
+                docker_bash_script=container.get("setup_shell_script")
             )
 
         # get the clearml.conf encoded file, make sure we use system packages!
