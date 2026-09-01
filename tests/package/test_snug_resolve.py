@@ -66,9 +66,10 @@ def test_resolve_shim_path_ignores_empty_override(monkeypatch):
 
 
 def _patch_resource_filename(monkeypatch, tmp_path, create=True):
-    """Patch pkg_resources.resource_filename to record the requested relative
-    path and return a real file under tmp_path (so os.path.isfile passes).
-    Returns a one-element list that will hold the captured relative path."""
+    """Patch the resource_filename bound in snug's namespace to record the
+    requested relative path and return a real file under tmp_path (so
+    os.path.isfile passes). Returns a one-element list that will hold the
+    captured relative path."""
     captured = []
 
     def _fake(pkg, rel):
@@ -79,7 +80,10 @@ def _patch_resource_filename(monkeypatch, tmp_path, create=True):
             dest.write_bytes(b"")
         return str(dest)
 
-    monkeypatch.setattr("pkg_resources.resource_filename", _fake)
+    # snug imports resource_filename at module level (vendored on 3.12+, system
+    # pkg_resources below), so patch the name in snug's namespace directly rather
+    # than the source module — independent of which gate branch was taken.
+    monkeypatch.setattr(snug, "resource_filename", _fake)
     return captured
 
 

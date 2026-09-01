@@ -30,9 +30,24 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 from typing import Optional
 from urllib.parse import urlparse
+
+# setuptools >= 82 removed the top-level ``pkg_resources``. Gate on
+# ``sys.version_info`` at MODULE level (a static branch, not a runtime
+# try/except): on 3.12+ this binds ``resource_filename`` from the vendored
+# copy, so the Nuitka bootstrap build — which runs with setuptools >= 82 and no
+# top-level ``pkg_resources`` — never has to resolve that import. Mirrors
+# external/requirements_parser/requirement.py, the proven-compiling pattern.
+if sys.version_info >= (3, 12):
+    from .._vendor.pkg_resources import resource_filename
+else:
+    try:
+        from pkg_resources import resource_filename  # noqa
+    except ImportError:
+        from .._vendor.pkg_resources import resource_filename
 
 
 # -- Call-history control: task User Properties + shim env -------------------
@@ -131,6 +146,19 @@ def _resolve_platform_tags(force_system=None, force_arch=None):
     return system, arch, ext
 
 
+def _bundled_resource_path(relative):
+    # type: (str) -> Optional[str]
+    """Absolute on-disk path to a data file bundled in the installed
+    clearml_agent wheel (``relative`` is package-relative), or ``None`` when it
+    is absent or unreachable as a real file. resource_filename hands the dynamic
+    linker a real path even for a zipped install."""
+    try:
+        path = resource_filename("clearml_agent", relative)
+    except Exception:
+        return None
+    return path if os.path.isfile(path) else None
+
+
 def resolve_shim_path(force_system=None, force_arch=None):
     # type: (Optional[str], Optional[str]) -> Optional[str]
     """Locate the preload shim shipped inside the installed wheel.
@@ -166,20 +194,7 @@ def resolve_shim_path(force_system=None, force_arch=None):
     if tags is None:
         return None
     _system, arch, ext = tags
-    try:
-        # resource_filename resolves the bundled shim to a real on-disk path
-        # (required for the dynamic linker) even if clearml_agent were installed
-        # zipped.
-        from pkg_resources import resource_filename
-        path = resource_filename(
-            "clearml_agent",
-            _SHIM_RELATIVE_PATH.format(arch=arch, ext=ext),
-        )
-    except Exception:
-        return None
-    if not os.path.isfile(path):
-        return None
-    return path
+    return _bundled_resource_path(_SHIM_RELATIVE_PATH.format(arch=arch, ext=ext))
 
 
 def resolve_proxy_path(force_system=None, force_arch=None):
@@ -215,19 +230,7 @@ def resolve_proxy_path(force_system=None, force_arch=None):
     # the proxy for the (always-Linux) task container passes force_system="Linux".
     if system != "Linux":
         return None
-    try:
-        # resource_filename resolves the bundled binary to a real on-disk path
-        # even if clearml_agent were installed zipped.
-        from pkg_resources import resource_filename
-        path = resource_filename(
-            "clearml_agent",
-            _PROXY_RELATIVE_PATH.format(arch=arch),
-        )
-    except Exception:
-        return None
-    if not os.path.isfile(path):
-        return None
-    return path
+    return _bundled_resource_path(_PROXY_RELATIVE_PATH.format(arch=arch))
 
 
 def proxy_binary_available(force_system=None, force_arch=None):
