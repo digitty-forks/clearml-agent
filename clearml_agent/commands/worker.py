@@ -3164,6 +3164,10 @@ class Worker(ServiceCommandSection):
             except Exception:
                 pass
 
+            # resolve the executable name to an absolute path: os.execv() (skip path) does not search PATH
+            if found_python:
+                found_python = find_executable(found_python) or found_python
+
             use_uv = True  # default to UV for compiled agent
 
             if requested_pkg_manager not in ("pip", ):

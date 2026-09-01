@@ -103,13 +103,36 @@ class PackageManager(object):
         return False
 
     def upgrade_pip(self):
-        result = self._install(
-            *select_for_platform(
-                windows=self.get_pip_versions(),
-                linux=self.get_pip_versions()
-            ),
-            "--upgrade"
-        )
+        if "__compiled__" in globals():
+            # Compiled agent may run offline: don't let the pip upgrade hang on an unreachable index.
+            if not self._pip_version:
+                # Nothing to enforce: keep the existing pip instead of a pointless --upgrade.
+                print("INFO: no pip version configured - keeping the pip already available in the "
+                      "environment and skipping the pip upgrade.")
+                result = None
+            else:
+                # Enforce the pin best-effort, fail fast, and keep the existing pip on failure.
+                try:
+                    result = self._install(
+                        *select_for_platform(
+                            windows=self.get_pip_versions(),
+                            linux=self.get_pip_versions()
+                        ),
+                        "--upgrade",
+                        "--retries", "1", "--timeout", "15",
+                    )
+                except Exception as ex:
+                    print("WARNING: could not set the configured pip version ({}). Continuing with the "
+                          "pip already available in the environment.".format(ex))
+                    result = None
+        else:
+            result = self._install(
+                *select_for_platform(
+                    windows=self.get_pip_versions(),
+                    linux=self.get_pip_versions()
+                ),
+                "--upgrade"
+            )
 
         packages = (self.freeze(freeze_full_environment=True) or dict()).get("pip")
         if packages:
