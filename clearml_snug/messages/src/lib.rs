@@ -93,14 +93,17 @@ pub enum Event {
         /// backward-compatible with shims that predate body parsing.
         #[serde(default)]
         tokens_measured: bool,
-        /// Prompt-cache breakdown of the input that `tokens_in` already folds in,
-        /// for providers that report one: tokens served from the prompt cache
-        /// (e.g. `cache_read_input_tokens`) and tokens written to it
-        /// (e.g. `cache_creation_input_tokens`). Surfaced as their own SCALARS
-        /// series so the dashboard separates fresh / cache-read / cache-write
-        /// input, while `tokens_in` stays the summed billable total the usage sink
-        /// reports. 0 when a provider reports no breakdown (a cache-inclusive
-        /// prompt total) and for non-usage requests. `#[serde(default)]` for wire
+        /// Prompt-cache breakdown of the input that `tokens_in` already folds in:
+        /// tokens served from the prompt cache and tokens written to it. Surfaced
+        /// as their own SCALARS series so the dashboard separates fresh /
+        /// cache-read / cache-write input, and subtracted from `tokens_in` to form
+        /// the fresh `prompt_tokens` the usage sink reports; `tokens_in` itself
+        /// stays the cache-inclusive billable total on this event (the aggregator
+        /// consumes it verbatim). Populated for Anthropic (`cache_read_input_tokens`
+        /// / `cache_creation_input_tokens`), OpenAI (`prompt_tokens_details`
+        /// `.cached_tokens` / `.cache_write_tokens`), and native Gemini
+        /// (`cachedContentTokenCount`, no write); 0 when a provider reports no
+        /// breakdown and for non-usage requests. `#[serde(default)]` for wire
         /// back-compat.
         #[serde(default)]
         cache_read_tokens: u64,

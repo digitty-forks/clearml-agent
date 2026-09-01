@@ -87,13 +87,13 @@ enum RespMode {
 pub struct Finalized {
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Anthropic prompt-cache breakdown of the input `tokens_in` already folds
-    /// in: tokens served from the cache (`cache_read_input_tokens`) and tokens
-    /// written to it (`cache_creation_input_tokens`). Surfaced separately so the
-    /// metrics sink can plot fresh vs cache-read vs cache-write input, while
-    /// `tokens_in` stays the summed billable total. `None` for OpenAI/Gemini
-    /// (they report a cache-inclusive prompt total with no breakdown) and where
-    /// no usage was parsed.
+    /// Prompt-cache breakdown of the input `tokens_in` already folds in: tokens
+    /// served from the cache and tokens written to it. Surfaced separately so the
+    /// sinks can split fresh vs cache-read vs cache-write input, while `tokens_in`
+    /// stays the billable total. Anthropic: `cache_read_input_tokens` /
+    /// `cache_creation_input_tokens`; OpenAI: `prompt_tokens_details.cached_tokens`
+    /// / `.cache_write_tokens`; native Gemini: `cachedContentTokenCount` (no
+    /// write). `None` where a provider reports no breakdown or no usage was parsed.
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub tool_calls: u64,
@@ -138,10 +138,11 @@ pub struct RespParse {
     // --- results ---
     measured_in: Option<u64>,
     measured_out: Option<u64>,
-    /// Anthropic-only prompt-cache breakdown of the input, captured alongside
-    /// `measured_in` (they ride the same `usage` object on `message_start`).
-    /// Merged with the same latest-wins-if-Some semantics, so `message_delta`
-    /// (output only) never clobbers them.
+    /// Prompt-cache breakdown of the input, captured alongside `measured_in`
+    /// (they ride the same `usage`/`usageMetadata` object — Anthropic
+    /// `message_start`, OpenAI/Gemini the final usage chunk). Merged with the
+    /// same latest-wins-if-Some semantics, so an output-only delta event never
+    /// clobbers them.
     measured_cache_read: Option<u64>,
     measured_cache_write: Option<u64>,
     /// Model name parsed from the response (`model` for Anthropic/OpenAI,
@@ -455,9 +456,13 @@ impl RespParse {
 
 /// Token usage extracted from one parsed provider JSON value. `None` per field
 /// so callers can merge with latest-wins semantics across streamed events.
-/// `input` is the billable input total; `cache_read`/`cache_write` are the two
-/// Anthropic prompt-cache buckets, already folded into `input`, kept separate
-/// so the metrics sink can plot the fresh-vs-cached breakdown.
+/// `input` is the billable input total (cache-inclusive for every provider);
+/// `cache_read`/`cache_write` are the prompt-cache buckets contained within it,
+/// kept separate so the sinks can split fresh vs cache-read vs cache-write.
+/// Anthropic sums its three raw buckets into `input`; OpenAI/Gemini report a
+/// cache-inclusive `input` already, with the cached portion a subset of it.
+/// `cache_write` is `None` where a provider reports no cache-creation count
+/// (OpenAI classic, native Gemini).
 #[derive(Debug, Default, Clone, Copy)]
 struct Usage {
     input: Option<u64>,
@@ -533,29 +538,36 @@ fn extract_usage(provider: Provider, v: &Value) -> Usage {
             match u {
                 // Streaming chunks carry `"usage": null` until the final one;
                 // require an object so nulls are skipped.
-                Some(u) if u.is_object() => Usage {
-                    input: u
-                        .get("prompt_tokens")
-                        .or_else(|| u.get("input_tokens"))
-                        .and_then(Value::as_u64),
-                    output: u
-                        .get("completion_tokens")
-                        .or_else(|| u.get("output_tokens"))
-                        .and_then(Value::as_u64),
-                    // Cached portion of the (cache-inclusive) input: Chat
-                    // Completions `prompt_tokens_details.cached_tokens`, Responses
-                    // API `input_tokens_details.cached_tokens`. The reporter folds
-                    // this into the task-metrics scalars only (fresh = input -
-                    // cache_read); the report_llm_usage billing event carries just
-                    // tokens_in/out. OpenAI auto-caches with no explicit write, so
-                    // cache_write stays None.
-                    cache_read: u
+                Some(u) if u.is_object() => {
+                    // `cached_tokens` (read) and `cache_write_tokens` (write, on
+                    // reasoning models) sit under `prompt_tokens_details` (Chat
+                    // Completions) or `input_tokens_details` (Responses API), and
+                    // are both SUBSETS of the cache-inclusive input, so `input`
+                    // stays the full prompt total and the fresh split (input −
+                    // read − write) is done downstream, exactly as for Anthropic.
+                    // OpenAI's own models auto-cache with no explicit write, so
+                    // cache_write is usually absent (→ None); it is still read for
+                    // any OpenAI-compatible provider that reports it.
+                    let details = u
                         .get("prompt_tokens_details")
-                        .or_else(|| u.get("input_tokens_details"))
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(Value::as_u64),
-                    cache_write: None,
-                },
+                        .or_else(|| u.get("input_tokens_details"));
+                    Usage {
+                        input: u
+                            .get("prompt_tokens")
+                            .or_else(|| u.get("input_tokens"))
+                            .and_then(Value::as_u64),
+                        output: u
+                            .get("completion_tokens")
+                            .or_else(|| u.get("output_tokens"))
+                            .and_then(Value::as_u64),
+                        cache_read: details
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(Value::as_u64),
+                        cache_write: details
+                            .and_then(|d| d.get("cache_write_tokens"))
+                            .and_then(Value::as_u64),
+                    }
+                }
                 _ => Usage::default(),
             }
         }
@@ -1240,6 +1252,84 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         let f = feed_all(&resp, Provider::Gemini).finalize();
         assert_eq!(f.tokens_in, Some(11));
         assert!(f.cache_read_tokens.is_none() && f.cache_write_tokens.is_none());
+    }
+
+    #[test]
+    fn openai_extracts_cache_read_from_details() {
+        // Classic OpenAI (gpt-4o-mini): cached_tokens is a subset of prompt_tokens,
+        // no cache_write. `input` stays the cache-inclusive prompt_tokens (fresh is
+        // derived downstream). Values are a real gpt-4o-mini body.
+        let body = br#"{"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":13219,"completion_tokens":1,"total_tokens":13220,"prompt_tokens_details":{"cached_tokens":13184,"audio_tokens":0}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!(f.tokens_in, Some(13219), "input stays cache-inclusive prompt_tokens");
+        assert_eq!(f.cache_read_tokens, Some(13184));
+        assert_eq!(f.cache_write_tokens, None, "classic OpenAI has no cache_write");
+    }
+
+    #[test]
+    fn openai_extracts_cache_write_from_details() {
+        // Reasoning-model (gpt-5.6) bodies: cache_write_tokens rides
+        // prompt_tokens_details on the cold call, cached_tokens on the warm call;
+        // both subsets of prompt_tokens. Real gpt-5.6 cold/warm bodies.
+        let cold = br#"{"model":"gpt-5.6","choices":[],"usage":{"prompt_tokens":13218,"completion_tokens":4,"total_tokens":13222,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":13215,"audio_tokens":0}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(cold);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!(f.tokens_in, Some(13218));
+        assert_eq!(f.cache_read_tokens, Some(0));
+        assert_eq!(f.cache_write_tokens, Some(13215));
+
+        let warm = br#"{"model":"gpt-5.6","choices":[],"usage":{"prompt_tokens":13218,"completion_tokens":4,"total_tokens":13222,"prompt_tokens_details":{"cached_tokens":13215,"cache_write_tokens":0,"audio_tokens":0}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(warm);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!(f.tokens_in, Some(13218));
+        assert_eq!(f.cache_read_tokens, Some(13215));
+        assert_eq!(f.cache_write_tokens, Some(0));
+    }
+
+    #[test]
+    fn openai_extracts_both_cache_buckets_simultaneously() {
+        // Synthetic: a single body carrying BOTH cached_tokens and
+        // cache_write_tokens non-zero. Not observed live (real bodies show one at a
+        // time), but the extractor must surface both; the fresh split downstream is
+        // guarded by saturating_sub.
+        let body = br#"{"model":"gpt-5.6","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":50}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!(f.tokens_in, Some(100));
+        assert_eq!(f.cache_read_tokens, Some(40));
+        assert_eq!(f.cache_write_tokens, Some(50));
+    }
+
+    #[test]
+    fn openai_sse_final_chunk_carries_cache() {
+        // The cache fields ride the final usage chunk (stream_options.include_usage);
+        // the earlier `usage: null` chunk must not clobber them (latest-wins-if-Some).
+        let body = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n\
+data: {\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":13219,\"completion_tokens\":1,\"total_tokens\":13220,\"prompt_tokens_details\":{\"cached_tokens\":13184}}}\n\n\
+data: [DONE]\n\n";
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!(f.tokens_in, Some(13219));
+        assert_eq!(f.cache_read_tokens, Some(13184));
+    }
+
+    #[test]
+    fn gemini_extracts_cached_content_token_count() {
+        // Native Gemini: cachedContentTokenCount is a subset of promptTokenCount;
+        // no inline cache-write. Real explicit-context-cache body.
+        let body = br#"{"candidates":[],"usageMetadata":{"promptTokenCount":26406,"candidatesTokenCount":1,"totalTokenCount":26439,"cachedContentTokenCount":26401},"modelVersion":"gemini-2.5-flash"}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::Gemini).finalize();
+        assert_eq!(f.tokens_in, Some(26406), "input stays cache-inclusive promptTokenCount");
+        assert_eq!(f.cache_read_tokens, Some(26401));
+        assert_eq!(f.cache_write_tokens, None, "native Gemini reports no inline cache-write");
     }
 
     #[test]

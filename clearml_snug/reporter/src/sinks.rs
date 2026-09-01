@@ -10,8 +10,9 @@
 //! resolved provider:
 //!
 //!   * usage — per-request LLM usage to the backend `report_llm_usage`
-//!     endpoint as a single event carrying `prompt_tokens` + `completion_tokens`
-//!     (combined, not split) tagged `source="external"`, plus the model and
+//!     endpoint as a single event carrying the DISJOINT input split
+//!     `prompt_tokens` (fresh) + `cache_read_tokens` + `cache_write_tokens`, plus
+//!     `completion_tokens`, tagged `source="external"`, plus the model and
 //!     provider. Skipped when both token counts are zero, or when the request
 //!     resolved no model (a non-LLM call).
 //!   * task-metrics — per-request usage scalars to this task's SCALARS tab via
@@ -72,11 +73,12 @@ const MAX_REQ_BYTES: usize = 15_728_640; // 15 MB
 const FIELD_SPECS: &[(&str, &str)] = &[
     ("tokens_in", "LLM Input Tokens"),
     ("tokens_out", "LLM Output Tokens"),
-    // Anthropic prompt-cache split. These three input series are DISJOINT: "LLM
-    // Input Tokens" is FRESH (non-cached) input only, and cache-read / cache-write
-    // are the cached buckets, so the three sum to the billable input total. (The
-    // usage event reports that combined total as prompt_tokens; only the scalars
-    // split it — see metric_events.) Both cache buckets are 0 for OpenAI/Gemini.
+    // Prompt-cache split. These three input series are DISJOINT: "LLM Input
+    // Tokens" is FRESH (non-cached) input only, and cache-read / cache-write are
+    // the cached buckets, so the three sum to the billable input total. The usage
+    // event reports the SAME disjoint split (see usage_event / metric_events). The
+    // cache buckets are populated for Anthropic, OpenAI, and native Gemini; 0 for
+    // providers/requests that report no cache breakdown.
     ("cache_read_tokens", "LLM Cache Read Tokens"),
     ("cache_write_tokens", "LLM Cache Write Tokens"),
     ("latency_ms", "LLM Latency (ms)"),
@@ -150,9 +152,9 @@ struct ConnMeta {
 struct Completed {
     tokens_in: u64,
     tokens_out: u64,
-    /// Anthropic prompt-cache split of `tokens_in` (already summed into it):
-    /// cache-read and cache-write token counts, each its own scalar series. 0
-    /// for OpenAI/Gemini and non-cache requests.
+    /// Prompt-cache split of `tokens_in` (contained within it): cache-read and
+    /// cache-write token counts, each its own scalar series. Populated for
+    /// Anthropic, OpenAI, and native Gemini; 0 for non-cache requests.
     cache_read_tokens: u64,
     cache_write_tokens: u64,
     latency_ms: u64,
@@ -414,6 +416,8 @@ impl Sinks {
                                 model.as_deref(),
                                 *tokens_in,
                                 *tokens_out,
+                                *cache_read_tokens,
+                                *cache_write_tokens,
                                 *ts_ms,
                                 fwd,
                             );
@@ -464,6 +468,8 @@ impl Sinks {
         model: Option<&str>,
         tokens_in: u64,
         tokens_out: u64,
+        cache_read: u64,
+        cache_write: u64,
         ts_ms: u64,
         fwd: &mut LogForwarder,
     ) {
@@ -481,10 +487,15 @@ impl Sinks {
             _ => return,
         };
         let provider = host_to_model_name(host);
-        let event = self.usage_event(&provider, model, tokens_in, tokens_out, resolve_ts(ts_ms));
+        let event = self.usage_event(
+            &provider, model, tokens_in, tokens_out, cache_read, cache_write, resolve_ts(ts_ms),
+        );
         fwd.enqueue_diagnostic(&format!(
-            "[SNUG-USAGE] queued report_llm_usage provider={:?} model={:?} prompt_tokens={} completion_tokens={}",
-            provider, model, tokens_in, tokens_out
+            "[SNUG-USAGE] queued report_llm_usage provider={:?} model={:?} \
+             prompt_tokens(fresh)={} cache_read={} cache_write={} completion_tokens={}",
+            provider, model,
+            tokens_in.saturating_sub(cache_read).saturating_sub(cache_write),
+            cache_read, cache_write, tokens_out
         ));
         self.enqueue_usage(vec![event]);
     }
@@ -504,26 +515,36 @@ impl Sinks {
     }
 
     /// Build the `report_llm_usage` event for one request: a single row carrying
-    /// the combined `prompt_tokens` + `completion_tokens`, tagged
-    /// `source="external"` (the SNUG meters the task's own egress, not the
-    /// ClearML gateway). `model` is the per-request model (the usage coset);
-    /// `provider` is the coarse host label. `task`/`user`/`project` attribute the
-    /// usage — `user`/`project` are omitted when the agent didn't supply them
-    /// (the backend then derives them from the task). No I/O.
+    /// the DISJOINT input split — `prompt_tokens` (fresh, uncached) +
+    /// `cache_read_tokens` + `cache_write_tokens` — plus `completion_tokens`, so
+    /// the four sum to the billable total for every provider. Tagged
+    /// `source="external"` (SNUG meters the task's own egress, not the ClearML
+    /// gateway). `model` is the per-request model (the usage coset); `provider` is
+    /// the coarse host label. `task`/`user`/`project` attribute the usage —
+    /// `user`/`project` are omitted when the agent didn't supply them (the backend
+    /// then derives them from the task). No I/O.
     fn usage_event(
         &self,
         provider: &str,
         model: &str,
         tokens_in: u64,
         tokens_out: u64,
+        cache_read: u64,
+        cache_write: u64,
         ts_ms: u64,
     ) -> Value {
+        // FRESH (uncached) input, the same split metric_events plots: prompt +
+        // cache_read + cache_write sums back to the billable input total.
+        // saturating_sub guards the impossible read + write > tokens_in.
+        let fresh = tokens_in.saturating_sub(cache_read).saturating_sub(cache_write);
         let mut ev = serde_json::Map::new();
         ev.insert("timestamp".to_string(), json!(ts_ms));
         ev.insert("source".to_string(), json!("external"));
         ev.insert("model".to_string(), json!(model));
         ev.insert("provider".to_string(), json!(provider));
-        ev.insert("prompt_tokens".to_string(), json!(tokens_in));
+        ev.insert("prompt_tokens".to_string(), json!(fresh));
+        ev.insert("cache_read_tokens".to_string(), json!(cache_read));
+        ev.insert("cache_write_tokens".to_string(), json!(cache_write));
         ev.insert("completion_tokens".to_string(), json!(tokens_out));
         ev.insert("task".to_string(), json!(self.task_id));
         if !self.user.is_empty() {
@@ -641,11 +662,10 @@ impl Sinks {
             .map(|&field| {
                 let value = match field {
                     "requests" => req_count as f64,
-                    // Scalar SPLIT: the "LLM Input Tokens" series is FRESH
+                    // Input SPLIT: the "LLM Input Tokens" series is FRESH
                     // (non-cached) input only, so it + cache-read + cache-write are
                     // disjoint and sum to the billable input total. The usage event
-                    // still reports that combined total as prompt_tokens (see the
-                    // report path / usage_event) — only the scalars split it.
+                    // reports the SAME disjoint split (see usage_event).
                     "tokens_in" => c
                         .tokens_in
                         .saturating_sub(c.cache_read_tokens)
@@ -945,13 +965,16 @@ mod tests {
     #[test]
     fn usage_event_combines_in_and_out_with_source() {
         let s = sinks(&["tokens_in"]);
-        let e = s.usage_event("Anthropic", "claude-haiku-4-5", 19, 42, 1000);
+        // No cache -> fresh == tokens_in, both cache buckets 0.
+        let e = s.usage_event("Anthropic", "claude-haiku-4-5", 19, 42, 0, 0, 1000);
         assert_eq!(e["timestamp"], 1000);
         assert_eq!(e["source"], "external");
         assert_eq!(e["provider"], "Anthropic");
         assert_eq!(e["model"], "claude-haiku-4-5");
-        // input + output combined into one event, renamed per the schema.
+        // Disjoint input split + output in one event, renamed per the schema.
         assert_eq!(e["prompt_tokens"], 19);
+        assert_eq!(e["cache_read_tokens"], 0);
+        assert_eq!(e["cache_write_tokens"], 0);
         assert_eq!(e["completion_tokens"], 42);
         assert_eq!(e["task"], "task-1"); // sinks() builds task "task-1"
         // user/project omitted when unset; the legacy fields are gone.
@@ -971,9 +994,85 @@ mod tests {
             "user-9".into(),
             "proj-7".into(),
         );
-        let e = s.usage_event("OpenAI", "gpt-4o", 1, 2, 1000);
+        let e = s.usage_event("OpenAI", "gpt-4o", 1, 2, 0, 0, 1000);
         assert_eq!(e["user"], "user-9");
         assert_eq!(e["project"], "proj-7");
+    }
+
+    #[test]
+    fn usage_event_splits_prompt_into_fresh_and_cache_buckets() {
+        // Anthropic-style: tokens_in is the billable total; prompt_tokens is the
+        // FRESH remainder and the two cache buckets ride their own fields, so
+        // prompt + read + write == tokens_in (the disjoint contract).
+        let s = sinks(&["tokens_in"]);
+        let e = s.usage_event("Anthropic", "claude-sonnet-4-5", 45305, 13, 45000, 300, 1000);
+        assert_eq!(e["prompt_tokens"], 5, "fresh = 45305 - 45000 - 300");
+        assert_eq!(e["cache_read_tokens"], 45000);
+        assert_eq!(e["cache_write_tokens"], 300);
+        assert_eq!(e["completion_tokens"], 13);
+        let sum = e["prompt_tokens"].as_u64().unwrap()
+            + e["cache_read_tokens"].as_u64().unwrap()
+            + e["cache_write_tokens"].as_u64().unwrap();
+        assert_eq!(sum, 45305, "buckets are disjoint and sum to the input total");
+    }
+
+    #[test]
+    fn usage_event_openai_subset_yields_fresh() {
+        // OpenAI: cached_tokens is a subset of prompt_tokens, so tokens_in (=
+        // prompt_tokens, cache-inclusive) minus cache_read gives fresh.
+        let s = sinks(&["tokens_in"]);
+        let e = s.usage_event("OpenAI", "gpt-4o-mini", 13219, 1, 13184, 0, 1000);
+        assert_eq!(e["prompt_tokens"], 35, "fresh = 13219 - 13184");
+        assert_eq!(e["cache_read_tokens"], 13184);
+        assert_eq!(e["cache_write_tokens"], 0);
+    }
+
+    #[test]
+    fn usage_event_clamps_when_cache_exceeds_input() {
+        // Defensive: an impossible read + write > tokens_in must not underflow;
+        // prompt_tokens clamps to 0.
+        let s = sinks(&["tokens_in"]);
+        let e = s.usage_event("OpenAI", "gpt-4o", 10, 2, 8, 5, 1000);
+        assert_eq!(e["prompt_tokens"], 0);
+        assert_eq!(e["cache_read_tokens"], 8);
+        assert_eq!(e["cache_write_tokens"], 5);
+    }
+
+    #[test]
+    fn usage_reports_cache_through_on_event() {
+        // End-to-end through on_event: a RequestCompleted carrying cache tokens
+        // yields a queued usage event with the disjoint split (proves the wiring,
+        // not just the pure builder).
+        let mut fwd = LogForwarder::new("t".into(), "w".into());
+        let mut s = Sinks::new("task-1".into(), true, false, &[], None, String::new(), String::new());
+        s.on_event(&started(1, "api.anthropic.com"), &mut fwd);
+        s.on_event(
+            &Event::RequestCompleted {
+                conn_id: 1,
+                ts_ms: 1000,
+                status: Some(200),
+                latency_ms: 1,
+                bytes_tx: 1,
+                bytes_rx: 1,
+                tokens_in: 45305,
+                tokens_out: 13,
+                tokens_measured: true,
+                cache_read_tokens: 45000,
+                cache_write_tokens: 300,
+                tool_calls: 0,
+                tool_call_errors: 0,
+                tool_call_names: vec![],
+                tool_call_error_names: vec![],
+                chat_id: None,
+                model: Some("claude-sonnet-4-5".into()),
+            },
+            &mut fwd,
+        );
+        let e = s.usage_buf.last().expect("usage event buffered");
+        assert_eq!(e["prompt_tokens"], 5);
+        assert_eq!(e["cache_read_tokens"], 45000);
+        assert_eq!(e["cache_write_tokens"], 300);
+        assert_eq!(e["completion_tokens"], 13);
     }
 
     #[test]
@@ -1171,8 +1270,8 @@ mod tests {
     fn metric_events_emit_cache_read_and_write_series() {
         // The input series are a DISJOINT split: "LLM Input Tokens" is FRESH only
         // (tokens_in - cache_read - cache_write), and the cache buckets plot on
-        // their own series; the three sum to the billable input total (which the
-        // usage event still reports combined as prompt_tokens).
+        // their own series; the three sum to the billable input total (the same
+        // disjoint split the usage event reports).
         let mut s = sinks(&["tokens_in", "cache_read_tokens", "cache_write_tokens"]);
         let c = Completed {
             tokens_in: 45302,
