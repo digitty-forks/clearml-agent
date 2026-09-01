@@ -325,6 +325,22 @@ Common flags:
 - `--version TAG` — install a specific release version (e.g., `v1.0.0`).
 - `--from-file PATH` — install from a local `.whl` file instead of downloading from the official GitHub Releases.
 
+#### Bootstrap and the uv package manager
+
+The bootstrap ships a precompiled `uv` binary, and the bootstrap script exports its full path inside the task container
+as `CLEARML_BOOTSTRAP_UV_EXEC` (usually `/tmp/.bootstrap.uv/uv`). When this variable is set, the agent runs every `uv`
+command with that binary instead of looking for `uv` inside the task's virtual environment. Set `CLEARML_BOOTSTRAP_UV_EXEC` yourself only if you want to point the agent at a `uv` binary of your own.
+
+The settings that control uv are independent of the bootstrap:
+
+| Setting | Environment variable | Meaning |
+|---|---|---|
+| `agent.package_manager.type: uv` | `CLEARML_AGENT_FORCE_UV=1` | Use uv as the package manager. |
+| `agent.package_manager.uv_replace_pip` | — | Use uv as a pip drop-in replacement, i.e. install the task's "installed packages" with uv instead of pip. The bootstrap turns this on implicitly, since a bootstrapped container may have no pip at all. |
+| — | `CLEARML_BOOTSTRAP_UV_EXEC` | Full path of the `uv` binary to use. Exported by the bootstrap script. |
+
+See `agent.bootstrap` in [`docs/clearml.conf`](docs/clearml.conf) for the remaining bootstrap options.
+
 #### Kubernetes (Enterprise Helm chart)
 
 > Bootstrap support for Kubernetes is available only in the ClearML Enterprise Agent Helm chart.
