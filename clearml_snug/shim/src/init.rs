@@ -42,9 +42,13 @@ fn shim_init() {
     #[cfg(target_os = "macos")]
     crate::hooks::macos::install();
 
-    // macOS: the reliable exit-time drain. The fishhook `_exit` rewrite misses
-    // CPython's libSystem-internal exit(3), so register an atexit(3) handler too.
-    #[cfg(target_os = "macos")]
+    // The reliable exit-time drain: libc runs atexit(3) handlers from inside
+    // exit(3) whoever called it, so it catches __libc_start_main's internal
+    // exit(main_ret) after CPython's main() returns — which neither the macOS
+    // `_exit` rebind nor the Linux `exit` PLT export reliably interposes. On
+    // Linux it backs up the `exit` interposer (both funnel through the
+    // single-shot exit_drain); on macOS it is the sole exit-time drain.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     crate::hooks::exit::install_atexit_drain();
 
     // Read the agent's handoff descriptor (creds + task + sink config) from the

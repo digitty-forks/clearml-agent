@@ -6,16 +6,19 @@
 //! a keep-alive pool at process teardown. Both call `flush_all_pending_requests`,
 //! so the emitted event is identical.
 //!
-//! The drain itself (`exit_drain`) is shared; how we get invoked differs:
-//!   * **Linux**: export `#[no_mangle] exit`; `__libc_start_main` calls `exit`
-//!     through a PLT relocation that our LD_PRELOAD export shadows, and we chain
-//!     via `dlsym(RTLD_NEXT, "exit")`.
-//!   * **macOS**: an `atexit(3)` handler (`install_atexit_drain`, registered
-//!     from the ctor) runs `exit_drain()` from inside `exit(3)`. We do NOT use
-//!     the fishhook here: CPython's final `exit(3)` originates inside the
-//!     libSystem umbrella (an intra-dylib call, not an interposable GOT slot),
-//!     so a `_exit` GOT rewrite misses it — verified empirically (the fishhook
-//!     never fired; the dropped trailing request only reappeared via atexit).
+//! The drain itself (`exit_drain`) is shared; it is reached two ways:
+//!   * an `atexit(3)` handler (`install_atexit_drain`, registered from the ctor)
+//!     on both Linux and macOS. libc runs atexit handlers from inside `exit(3)`
+//!     no matter who called it, so this catches `__libc_start_main`'s internal
+//!     `exit(main_ret)` after CPython's `main()` returns — a call symbol
+//!     interposition misses: on macOS the final `exit(3)` is an intra-libSystem
+//!     call (not an interposable GOT slot), and on Linux `__libc_start_main`'s
+//!     `exit` is not guaranteed to bind the LD_PRELOAD export. This is the
+//!     reliable path, and the sole mechanism on macOS.
+//!   * **Linux only**, additionally, a `#[no_mangle] exit` export that shadows a
+//!     PLT `exit` call and chains via `dlsym(RTLD_NEXT, "exit")` — belt-and-
+//!     suspenders for an explicit `exit()`. Both paths funnel through the
+//!     single-shot `exit_drain`, so running both is a no-op the second time.
 //!
 //! Running the flush BEFORE chaining means the Rust runtime, parking_lot, and
 //! the reporter thread are still alive.
@@ -110,23 +113,25 @@ pub unsafe extern "C" fn exit(status: libc::c_int) -> ! {
     }
 }
 
-// ---- macOS: drain via atexit(3) (reliable) ----
+// ---- atexit(3) drain: the reliable exit-time flush (Linux + macOS) ----
 //
-// On macOS the fishhook `_exit` GOT rewrite does NOT catch CPython's final
-// `exit(3)` — that call originates inside the libSystem umbrella (an intra-dylib
-// call, not an interposable GOT slot), so the rebind misses it and the trailing
-// request is never drained. `atexit(3)` is the reliable mechanism: libc runs
-// registered handlers from inside `exit(3)` regardless of who called it, while
-// the reporter thread is still alive. Same coverage as the intended exit(3)
-// hook — _exit(2)/abort/signals still skip it, by design.
+// libc runs atexit(3) handlers from inside `exit(3)` regardless of who called
+// it — including `__libc_start_main`'s internal `exit(main_ret)` after CPython's
+// `main()` returns, which symbol interposition misses on both platforms: the
+// macOS fishhook `_exit` GOT rewrite can't see the intra-libSystem `exit(3)`,
+// and the Linux `exit` PLT export isn't guaranteed to bind `__libc_start_main`'s
+// call. Without this the run's trailing RequestCompleted is never flushed. Runs
+// while the reporter thread is still alive; _exit(2)/abort/signals still skip it,
+// by design. On Linux it backs up the `exit` interposer above (both funnel
+// through the single-shot exit_drain).
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 extern "C" fn snug_atexit() {
     unsafe { exit_drain() };
 }
 
-/// Register the atexit drain. Called once from the ctor on macOS.
-#[cfg(target_os = "macos")]
+/// Register the atexit drain. Called once from the ctor.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn install_atexit_drain() {
     unsafe {
         libc::atexit(snug_atexit);
