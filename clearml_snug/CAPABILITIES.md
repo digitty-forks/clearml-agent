@@ -56,29 +56,31 @@ attributed to `claude-haiku-4-5` or `gpt-4o`, not just to "Anthropic" or
 
 ### Task scalars
 
-With `report_task_metrics: true`, each metered request is plotted on the task's
-own **SCALARS** tab. You get one chart per signal, with a series per
-provider/model:
+With `report_task_metrics: true`, SNUG plots the task's LLM usage on its own
+**SCALARS** tab as a **continuous per-second time series**: each wall-second
+reports that second's traffic (tokens / bytes / requests summed, latency
+averaged) and a second with no traffic reports **0**, so every line runs
+uninterrupted over time rather than as sparse points at each call. You get one
+chart per signal, with a series per provider/model (and per chat when the request
+identifies its conversation):
 
-| Chart | What it plots |
+| Chart | What it plots (per second) |
 |---|---|
 | `LLM Input Tokens` | fresh (non-cached) prompt tokens |
 | `LLM Cache Read Tokens` | prompt tokens served from the provider's cache |
 | `LLM Cache Write Tokens` | prompt tokens written into the cache |
 | `LLM Output Tokens` | completion tokens |
-| `LLM Requests` | cumulative metered request count |
-| `LLM Latency (ms)` | wall-clock request duration |
+| `LLM Requests` | metered requests completed in the second |
+| `LLM Latency (ms)` | mean request duration over the second |
 | `LLM Bytes Sent` / `LLM Bytes Received` | plaintext bytes per direction |
-| `LLM Tool Calls (signal)` | 0 baseline, +1 when a request used a tool, −1 when a tool result errored |
-| `LLM Tool Calls by Tool` | one series per tool name |
-| `LLM Tool Calls (cumulative)` | running tool-call totals |
-| `LLM Input Tokens (cumulative)` etc. | running total of each token chart above |
 
 The three input charts are a **disjoint split** — fresh, cache-read, and
 cache-write never double-count, so they sum to the provider's total prompt
-tokens. Each of the four token charts also has a `(cumulative)` twin plotting a
-running total. Pick which charts you want with `task_metrics_fields`,
-(selecting a token field gives you both its per-call and cumulative chart).
+tokens. A line keeps reporting 0 through gaps only while its conversation is
+**active** — after a couple of minutes of continuous idle a chat's line retires
+and resumes as a new segment if it speaks again, so a long-running task never
+accumulates a flat-zero line for every conversation it ever opened. Pick which
+charts you want with `task_metrics_fields`.
 
 ### Organization-wide usage reporting
 
@@ -276,7 +278,7 @@ none (in which case SNUG meters nothing and parses no bodies).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `report_task_metrics` | `false` | Report per-request usage to the task's own SCALARS tab. |
+| `report_task_metrics` | `false` | Report per-second LLM usage scalars to the task's own SCALARS tab. |
 | `report_usage_events` | `false` | Report per-request usage to the ClearML server's LLM-usage endpoint, for organization-wide reporting. |
 | `aggregator_url` | `null` | Forward each completed request, verbatim, to this URL as batched NDJSON. `null` disables it. |
 | `task_metrics_fields` | all fields | Which signals become scalar charts. Remove entries to narrow the output; an empty or all-unknown list falls back to all fields. Use `report_task_metrics: false` to turn the sink off entirely. |

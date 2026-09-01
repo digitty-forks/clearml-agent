@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use clearml_snug_messages::Event;
@@ -160,6 +160,20 @@ fn run_read_loop(
             }
         }
 
+        // Drain any further events already queued before the per-second tick, so
+        // a wall-clock tick can't advance past buckets whose events are still
+        // waiting (e.g. a backlog that built up while a slow flush blocked the
+        // loop) — that would misattribute their traffic to a later second and
+        // 0-fill the seconds they actually belong to.
+        while let Ok(ev) = rx.try_recv() {
+            handle_event(&ev, &mut fwd, &mut sinks, &mut wl_conns);
+        }
+
+        // Drive the per-second rate clock so the token/point series report 0
+        // through idle seconds even when no events arrive. Cheap: a no-op until
+        // the first request starts the clock and within the same wall-second.
+        sinks.on_tick(now_unix_ms(), &mut fwd);
+
         // Flush the log buffer + the sink buffers under one client lock when
         // either is full (size trigger) or the 5s timer fires.
         if fwd.should_flush() || sinks.should_flush() || last_flush.elapsed() >= FLUSH_INTERVAL {
@@ -185,6 +199,9 @@ fn run_read_loop(
             while let Ok(ev) = rx.try_recv() {
                 handle_event(&ev, &mut fwd, &mut sinks, &mut wl_conns);
             }
+            // Close the still-open rate second so its accumulated data isn't lost
+            // waiting for a tick that will never fire.
+            sinks.flush_final_rate(&mut fwd);
             if let Ok(mut c) = client.lock() {
                 fwd.flush(&mut *c);
                 // Single bounded pass — no next tick to retry, so unsent events
@@ -198,6 +215,16 @@ fn run_read_loop(
         }
     }
     done.store(true, Ordering::SeqCst);
+}
+
+/// Current wall-clock time as Unix milliseconds, for the per-second rate tick.
+/// Falls back to 0 (a pre-epoch clock) so the tick stays a no-op rather than
+/// panicking — the rate clock only needs a monotonic-ish second, not accuracy.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Forward one event to the task console and — when a reporting sink is active —
